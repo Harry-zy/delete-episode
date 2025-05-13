@@ -18,9 +18,6 @@ import (
 const (
 	// 重试次数和超时时间设置
 	MAX_RETRIES = 3
-	// 种子名称筛选结尾
-	NAME_SUFFIX_FILTER_1 = "ADWeb"
-	NAME_SUFFIX_FILTER_2 = "HHWEB"
 )
 
 // 定义一个结构体用于存储合集和分集的映射关系
@@ -81,6 +78,19 @@ func main() {
 	password, _ := reader.ReadString('\n')
 	password = strings.TrimSpace(password)
 
+	// 输入种子名称筛选结尾
+	fmt.Print("种子名称筛选结尾（多个以;分隔，直接回车则不筛选）[例如: ADWeb;HHWEB]: ")
+	suffixesInput, _ := reader.ReadString('\n')
+	suffixesInput = strings.TrimSpace(suffixesInput)
+	var suffixFilters []string
+	if suffixesInput != "" {
+		suffixFilters = strings.Split(suffixesInput, ";")
+		// 移除可能的空白
+		for i, suffix := range suffixFilters {
+			suffixFilters[i] = strings.TrimSpace(suffix)
+		}
+	}
+
 	// 显示连接信息给用户确认
 	fmt.Println("将使用以下连接参数:")
 	fmt.Printf("服务器地址: %s\n", serverAddress)
@@ -91,6 +101,12 @@ func main() {
 		fmt.Printf("密码: ******\n")
 	} else {
 		fmt.Printf("密码: \n")
+	}
+
+	if len(suffixFilters) > 0 {
+		fmt.Printf("种子名称筛选结尾: %s\n", strings.Join(suffixFilters, ", "))
+	} else {
+		fmt.Println("不进行种子名称筛选")
 	}
 
 	// 确认连接参数
@@ -117,21 +133,34 @@ func main() {
 		log.Fatalf("获取 torrent 列表失败: %v", err)
 	}
 
-	// 筛选出名称以ADWeb或HHWEB结尾的种子
+	// 筛选种子
 	var filteredTorrents []transmissionrpc.Torrent
-	for _, torrent := range torrents {
-		if torrent.Name != nil && (strings.HasSuffix(*torrent.Name, NAME_SUFFIX_FILTER_1) ||
-			strings.HasSuffix(*torrent.Name, NAME_SUFFIX_FILTER_2)) {
-			filteredTorrents = append(filteredTorrents, torrent)
+	if len(suffixFilters) > 0 {
+		// 按名称结尾筛选
+		for _, torrent := range torrents {
+			if torrent.Name != nil {
+				torrentName := *torrent.Name
+				for _, suffix := range suffixFilters {
+					if suffix != "" && strings.HasSuffix(torrentName, suffix) {
+						filteredTorrents = append(filteredTorrents, torrent)
+						break // 只要匹配一个后缀就添加
+					}
+				}
+			}
 		}
-	}
 
-	if len(filteredTorrents) == 0 {
-		fmt.Printf("未找到名称以 %s 或 %s 结尾的种子\n", NAME_SUFFIX_FILTER_1, NAME_SUFFIX_FILTER_2)
-		return
-	}
+		if len(filteredTorrents) == 0 {
+			fmt.Printf("未找到名称以 %s 结尾的种子\n", strings.Join(suffixFilters, ", "))
+			return
+		}
 
-	fmt.Printf("找到 %d 个名称以 %s 或 %s 结尾的种子\n", len(filteredTorrents), NAME_SUFFIX_FILTER_1, NAME_SUFFIX_FILTER_2)
+		fmt.Printf("找到 %d 个名称以 %s 结尾的种子\n",
+			len(filteredTorrents), strings.Join(suffixFilters, ", "))
+	} else {
+		// 不筛选，使用所有种子
+		filteredTorrents = torrents
+		fmt.Printf("没有应用筛选，将处理所有 %d 个种子\n", len(torrents))
+	}
 
 	// 查找合集和分集关系
 	fmt.Println("开始查找合集和分集关系...")
