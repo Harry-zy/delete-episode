@@ -174,11 +174,11 @@ func main() {
 		// 显示合集信息
 		if group.Collection != nil && group.Collection.ID != nil && group.Collection.SizeWhenDone != nil {
 			collectionSize := (*group.Collection.SizeWhenDone).MB()
-			fmt.Printf("合集: ID: %d, 大小: %.2f MB\n", *group.Collection.ID, collectionSize)
+			fmt.Printf("合集(不会被暂停): ID: %d, 大小: %.2f MB\n", *group.Collection.ID, collectionSize)
 		}
 
 		// 显示分集信息
-		fmt.Printf("包含 %d 个分集:\n", len(group.Episodes))
+		fmt.Printf("包含 %d 个分集(将被暂停):\n", len(group.Episodes))
 		for i, episode := range group.Episodes {
 			if episode != nil && episode.ID != nil && episode.SizeWhenDone != nil {
 				episodeSize := (*episode.SizeWhenDone).MB()
@@ -191,7 +191,7 @@ func main() {
 	}
 
 	// 询问用户是否暂停这些种子
-	fmt.Print("\n是否要暂停这些合集和分集种子? (y/n): ")
+	fmt.Print("\n是否要暂停分集种子? (y/n): ")
 	var answer string
 	fmt.Scanln(&answer)
 
@@ -201,8 +201,8 @@ func main() {
 	}
 
 	// 暂停合集和分集种子
-	successCount, failedCount := pauseCollectionAndEpisodes(client, duplicateGroups)
-	fmt.Printf("\n操作完成: 成功暂停 %d 个种子, 失败 %d 个种子\n", successCount, failedCount)
+	successCount, failedCount := pauseEpisodes(client, duplicateGroups)
+	fmt.Printf("\n操作完成: 成功暂停 %d 个分集, 失败 %d 个分集\n", successCount, failedCount)
 }
 
 // 带重试的获取种子列表
@@ -452,19 +452,14 @@ func getFileName(path string) string {
 	return parts[len(parts)-1]
 }
 
-// 暂停合集和分集种子
-func pauseCollectionAndEpisodes(client *transmissionrpc.Client, duplicateGroups map[string]DuplicateGroup) (int, int) {
+// 只暂停分集种子，不暂停合集
+func pauseEpisodes(client *transmissionrpc.Client, duplicateGroups map[string]DuplicateGroup) (int, int) {
 	successCount := 0
 	failedCount := 0
 
-	for _, group := range duplicateGroups {
-		// 收集所有需要暂停的种子ID
+	for groupName, group := range duplicateGroups {
+		// 只收集分集ID，不包括合集
 		var torrentIDs []int64
-
-		// 添加合集ID
-		if group.Collection != nil && group.Collection.ID != nil {
-			torrentIDs = append(torrentIDs, *group.Collection.ID)
-		}
 
 		// 添加所有分集ID
 		for _, episode := range group.Episodes {
@@ -473,20 +468,22 @@ func pauseCollectionAndEpisodes(client *transmissionrpc.Client, duplicateGroups 
 			}
 		}
 
-		// 暂停这些种子
+		// 暂停这些分集
 		if len(torrentIDs) > 0 {
+			fmt.Printf("正在暂停 \"%s\" 的 %d 个分集...\n", groupName, len(torrentIDs))
+
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			err := client.TorrentStopIDs(ctx, torrentIDs)
 			cancel()
 
 			if err == nil {
 				successCount += len(torrentIDs)
-				fmt.Printf("成功暂停 %d 个种子\n", len(torrentIDs))
+				fmt.Printf("成功暂停 %d 个分集\n", len(torrentIDs))
 			} else {
 				failedCount += len(torrentIDs)
-				fmt.Printf("暂停种子失败: %v\n", err)
+				fmt.Printf("暂停分集失败: %v\n", err)
 
-				// 单独尝试暂停每个种子
+				// 单独尝试暂停每个分集
 				for _, id := range torrentIDs {
 					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 					err := client.TorrentStopIDs(ctx, []int64{id})
@@ -495,9 +492,9 @@ func pauseCollectionAndEpisodes(client *transmissionrpc.Client, duplicateGroups 
 					if err == nil {
 						successCount++
 						failedCount--
-						fmt.Printf("成功暂停种子 ID: %d\n", id)
+						fmt.Printf("成功暂停分集 ID: %d\n", id)
 					} else {
-						fmt.Printf("暂停种子 ID: %d 失败: %v\n", id, err)
+						fmt.Printf("暂停分集 ID: %d 失败: %v\n", id, err)
 					}
 
 					time.Sleep(1 * time.Second)
