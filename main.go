@@ -210,7 +210,10 @@ func findCollectionsAndEpisodes(client *transmissionrpc.Client, torrents []trans
 
 	// 查找合集和分集
 	result := make(map[string]DuplicateGroup)
+	var processedCount, skippedCount, withoutEpisodesCount int
+
 	for name, group := range nameGroups {
+		processedCount++
 		if len(group) > 1 {
 			// 排序：按大小从大到小排序（合集通常比分集大）
 			var sortedGroup []transmissionrpc.Torrent = make([]transmissionrpc.Torrent, len(group))
@@ -238,6 +241,7 @@ func findCollectionsAndEpisodes(client *transmissionrpc.Client, torrents []trans
 				collectionFiles, err := getTorrentFiles(client, collection.ID)
 				if err != nil {
 					log.Printf("获取种子 ID: %d 文件列表失败: %v", *collection.ID, err)
+					skippedCount++
 					continue
 				}
 
@@ -267,10 +271,30 @@ func findCollectionsAndEpisodes(client *transmissionrpc.Client, torrents []trans
 						Episodes:        episodes,
 						HasFileOverlaps: hasFileOverlaps,
 					}
+				} else {
+					// 记录没有找到分集的种子
+					if len(episodes) == 0 {
+						if collection.Name != nil {
+							fmt.Printf("跳过没有分集的种子: %s\n", *collection.Name)
+						}
+						withoutEpisodesCount++
+					}
 				}
 			}
+		} else {
+			// 记录单种子的情况（不是名称重复的）
+			if group[0].Name != nil {
+				fmt.Printf("跳过单个种子: %s\n", *group[0].Name)
+			}
+			skippedCount++
 		}
 	}
+
+	fmt.Printf("\n筛选统计：\n")
+	fmt.Printf("- 处理种子组数量: %d\n", processedCount)
+	fmt.Printf("- 跳过种子组数量: %d\n", skippedCount)
+	fmt.Printf("- 没有找到分集的种子组数量: %d\n", withoutEpisodesCount)
+	fmt.Printf("- 符合条件的种子组数量: %d\n", len(result))
 
 	return result
 }
