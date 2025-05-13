@@ -1,0 +1,24 @@
+# 二进制文件
+delete-episode
+delete-episode.exe
+delete-episode-mac
+
+# 压缩包
+*.zip
+
+# 临时目录
+windows-dist/
+mac-dist/
+
+# Go特定文件
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/vendor/
+
+# 系统文件
+.DS_Store
+Thumbs.db 
