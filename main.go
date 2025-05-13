@@ -210,11 +210,36 @@ func findCollectionsAndEpisodes(client *transmissionrpc.Client, torrents []trans
 
 	// 查找合集和分集
 	result := make(map[string]DuplicateGroup)
-	var processedCount, skippedCount, withoutEpisodesCount int
+	var processedCount, skippedCount, withoutEpisodesCount, sameSizeCount int
 
 	for name, group := range nameGroups {
 		processedCount++
 		if len(group) > 1 {
+			// 检查所有种子大小是否相同
+			allSameSizes := true
+			var baseSize float64
+			if group[0].SizeWhenDone != nil {
+				baseSize = (*group[0].SizeWhenDone).Byte()
+			}
+
+			for i := 1; i < len(group); i++ {
+				if group[i].SizeWhenDone != nil {
+					currentSize := (*group[i].SizeWhenDone).Byte()
+					// 如果发现大小不同（允许1KB以内的误差），标记为不同
+					if abs(currentSize-baseSize) > 1024 {
+						allSameSizes = false
+						break
+					}
+				}
+			}
+
+			// 如果所有种子大小都相同，跳过这组种子
+			if allSameSizes {
+				fmt.Printf("跳过大小相同的种子组: %s (大小: %.2f MB)\n", name, baseSize/1024/1024)
+				sameSizeCount++
+				continue
+			}
+
 			// 排序：按大小从大到小排序（合集通常比分集大）
 			var sortedGroup []transmissionrpc.Torrent = make([]transmissionrpc.Torrent, len(group))
 			copy(sortedGroup, group)
@@ -293,10 +318,19 @@ func findCollectionsAndEpisodes(client *transmissionrpc.Client, torrents []trans
 	fmt.Printf("\n筛选统计：\n")
 	fmt.Printf("- 处理种子组数量: %d\n", processedCount)
 	fmt.Printf("- 跳过种子组数量: %d\n", skippedCount)
+	fmt.Printf("- 跳过大小相同的种子组数量: %d\n", sameSizeCount)
 	fmt.Printf("- 没有找到分集的种子组数量: %d\n", withoutEpisodesCount)
 	fmt.Printf("- 符合条件的种子组数量: %d\n", len(result))
 
 	return result
+}
+
+// 计算绝对值
+func abs(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 // 获取种子的文件列表
