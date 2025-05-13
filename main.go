@@ -22,6 +22,13 @@ const (
 	NAME_SUFFIX_FILTER_2 = "HHWEB"
 )
 
+// 定义一个结构体用于存储合集和分集的映射关系
+type DuplicateGroup struct {
+	Collection      *transmissionrpc.Torrent   // 合集种子（较大的文件）
+	Episodes        []*transmissionrpc.Torrent // 分集种子（较小的文件）
+	HasFileOverlaps bool                       // 是否文件列表有重叠
+}
+
 func main() {
 	reader := bufio.NewReader(os.Stdin)
 
@@ -122,29 +129,41 @@ func main() {
 
 	fmt.Printf("找到 %d 个名称以 %s 或 %s 结尾的种子\n", len(filteredTorrents), NAME_SUFFIX_FILTER_1, NAME_SUFFIX_FILTER_2)
 
-	// 在筛选的种子中查找名称相同且大小不同的种子
-	duplicates := findDuplicatesByName(filteredTorrents)
-	if len(duplicates) == 0 {
-		fmt.Println("未找到名称相同且大小不同的种子")
+	// 查找合集和分集关系
+	fmt.Println("开始查找合集和分集关系...")
+	duplicateGroups := findCollectionsAndEpisodes(client, filteredTorrents)
+
+	if len(duplicateGroups) == 0 {
+		fmt.Println("未找到合集和对应分集的种子")
 		return
 	}
 
-	// 显示找到的重复种子信息
-	fmt.Printf("找到 %d 组名称相同但大小不同的种子:\n", len(duplicates))
-	for groupName, group := range duplicates {
+	// 显示找到的合集和分集信息
+	fmt.Printf("找到 %d 组合集和对应分集:\n", len(duplicateGroups))
+	for groupName, group := range duplicateGroups {
 		fmt.Printf("\n组名: %s\n", groupName)
-		fmt.Printf("包含 %d 个种子:\n", len(group))
-		for i, torrent := range group {
-			if torrent.ID != nil && torrent.Name != nil && torrent.SizeWhenDone != nil {
-				// 将大小转换为MB显示
-				sizeInMB := (*torrent.SizeWhenDone).MB()
-				fmt.Printf("  %d. ID: %d, 大小: %.2f MB\n", i+1, *torrent.ID, sizeInMB)
+
+		// 显示合集信息
+		if group.Collection != nil && group.Collection.ID != nil && group.Collection.SizeWhenDone != nil {
+			collectionSize := (*group.Collection.SizeWhenDone).MB()
+			fmt.Printf("合集: ID: %d, 大小: %.2f MB\n", *group.Collection.ID, collectionSize)
+		}
+
+		// 显示分集信息
+		fmt.Printf("包含 %d 个分集:\n", len(group.Episodes))
+		for i, episode := range group.Episodes {
+			if episode != nil && episode.ID != nil && episode.SizeWhenDone != nil {
+				episodeSize := (*episode.SizeWhenDone).MB()
+				fmt.Printf("  %d. ID: %d, 大小: %.2f MB\n", i+1, *episode.ID, episodeSize)
 			}
 		}
+
+		// 显示文件重叠状态
+		fmt.Printf("文件列表重叠状态: %t\n", group.HasFileOverlaps)
 	}
 
 	// 询问用户是否暂停这些种子
-	fmt.Print("\n是否要暂停这些种子? (y/n): ")
+	fmt.Print("\n是否要暂停这些合集和分集种子? (y/n): ")
 	var answer string
 	fmt.Scanln(&answer)
 
@@ -153,8 +172,8 @@ func main() {
 		return
 	}
 
-	// 暂停重复的种子
-	successCount, failedCount := pauseDuplicateTorrents(client, duplicates)
+	// 暂停合集和分集种子
+	successCount, failedCount := pauseCollectionAndEpisodes(client, duplicateGroups)
 	fmt.Printf("\n操作完成: 成功暂停 %d 个种子, 失败 %d 个种子\n", successCount, failedCount)
 }
 
@@ -179,9 +198,9 @@ func getWithRetry(client *transmissionrpc.Client) ([]transmissionrpc.Torrent, er
 	return torrents, err
 }
 
-// 查找名称相同但大小不同的种子
-func findDuplicatesByName(torrents []transmissionrpc.Torrent) map[string][]transmissionrpc.Torrent {
-	// 先按名称分组
+// 查找合集和分集关系
+func findCollectionsAndEpisodes(client *transmissionrpc.Client, torrents []transmissionrpc.Torrent) map[string]DuplicateGroup {
+	// 按名称分组
 	nameGroups := make(map[string][]transmissionrpc.Torrent)
 	for _, torrent := range torrents {
 		if torrent.Name != nil {
@@ -189,27 +208,66 @@ func findDuplicatesByName(torrents []transmissionrpc.Torrent) map[string][]trans
 		}
 	}
 
-	// 筛选出名称相同但大小不同的种子组
-	result := make(map[string][]transmissionrpc.Torrent)
+	// 查找合集和分集
+	result := make(map[string]DuplicateGroup)
 	for name, group := range nameGroups {
 		if len(group) > 1 {
-			// 检查组内是否存在大小不同的种子
-			hasDifferentSizes := false
-			var baseSize float64
-
-			if group[0].SizeWhenDone != nil {
-				baseSize = (*group[0].SizeWhenDone).Byte()
-			}
-
-			for i := 1; i < len(group); i++ {
-				if group[i].SizeWhenDone != nil && (*group[i].SizeWhenDone).Byte() != baseSize {
-					hasDifferentSizes = true
-					break
+			// 排序：按大小从大到小排序（合集通常比分集大）
+			var sortedGroup []transmissionrpc.Torrent = make([]transmissionrpc.Torrent, len(group))
+			copy(sortedGroup, group)
+			for i := 0; i < len(sortedGroup); i++ {
+				for j := i + 1; j < len(sortedGroup); j++ {
+					if sortedGroup[i].SizeWhenDone != nil && sortedGroup[j].SizeWhenDone != nil {
+						sizeI := (*sortedGroup[i].SizeWhenDone).Byte()
+						sizeJ := (*sortedGroup[j].SizeWhenDone).Byte()
+						if sizeI < sizeJ {
+							sortedGroup[i], sortedGroup[j] = sortedGroup[j], sortedGroup[i]
+						}
+					}
 				}
 			}
 
-			if hasDifferentSizes {
-				result[name] = group
+			// 检查文件列表包含关系
+			if len(sortedGroup) >= 2 {
+				// 假设最大的是合集
+				collection := sortedGroup[0]
+				var episodes []*transmissionrpc.Torrent
+				hasFileOverlaps := false
+
+				// 获取合集的文件列表
+				collectionFiles, err := getTorrentFiles(client, collection.ID)
+				if err != nil {
+					log.Printf("获取种子 ID: %d 文件列表失败: %v", *collection.ID, err)
+					continue
+				}
+
+				// 对每个可能的分集检查文件列表
+				for i := 1; i < len(sortedGroup); i++ {
+					episode := sortedGroup[i]
+					episodeFiles, err := getTorrentFiles(client, episode.ID)
+					if err != nil {
+						log.Printf("获取种子 ID: %d 文件列表失败: %v", *episode.ID, err)
+						continue
+					}
+
+					// 检查分集文件是否包含在合集中
+					overlap := checkFileOverlap(collectionFiles, episodeFiles)
+					if overlap {
+						hasFileOverlaps = true
+						episodeCopy := episode // 创建副本以避免引用问题
+						episodes = append(episodes, &episodeCopy)
+					}
+				}
+
+				// 只有当存在文件重叠时才添加到结果
+				if hasFileOverlaps && len(episodes) > 0 {
+					collectionCopy := collection // 创建副本以避免引用问题
+					result[name] = DuplicateGroup{
+						Collection:      &collectionCopy,
+						Episodes:        episodes,
+						HasFileOverlaps: hasFileOverlaps,
+					}
+				}
 			}
 		}
 	}
@@ -217,17 +275,74 @@ func findDuplicatesByName(torrents []transmissionrpc.Torrent) map[string][]trans
 	return result
 }
 
-// 暂停重复的种子
-func pauseDuplicateTorrents(client *transmissionrpc.Client, duplicates map[string][]transmissionrpc.Torrent) (int, int) {
+// 获取种子的文件列表
+func getTorrentFiles(client *transmissionrpc.Client, torrentID *int64) ([]*transmissionrpc.TorrentFile, error) {
+	if torrentID == nil {
+		return nil, fmt.Errorf("种子ID为空")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// 获取种子详情，包含文件列表
+	torrent, err := client.TorrentGet(ctx, []string{"files"}, []int64{*torrentID})
+	if err != nil {
+		return nil, err
+	}
+
+	if len(torrent) == 0 || torrent[0].Files == nil {
+		return nil, fmt.Errorf("获取种子文件列表失败")
+	}
+
+	return torrent[0].Files, nil
+}
+
+// 检查文件重叠
+func checkFileOverlap(collectionFiles, episodeFiles []*transmissionrpc.TorrentFile) bool {
+	// 如果分集的所有文件都在合集中找到，则认为有重叠
+	var matchCount int
+
+	for _, episodeFile := range episodeFiles {
+		for _, collectionFile := range collectionFiles {
+			// 根据文件名（去掉路径）来比较
+			episodeFileName := getFileName(episodeFile.Name)
+			collectionFileName := getFileName(collectionFile.Name)
+
+			if episodeFileName == collectionFileName {
+				matchCount++
+				break
+			}
+		}
+	}
+
+	// 如果50%以上的分集文件在合集中找到，则认为有重叠
+	return matchCount >= len(episodeFiles)/2
+}
+
+// 从完整路径中获取文件名
+func getFileName(path string) string {
+	parts := strings.Split(path, "/")
+	return parts[len(parts)-1]
+}
+
+// 暂停合集和分集种子
+func pauseCollectionAndEpisodes(client *transmissionrpc.Client, duplicateGroups map[string]DuplicateGroup) (int, int) {
 	successCount := 0
 	failedCount := 0
 
-	for _, group := range duplicates {
-		// 对每组重复种子，创建暂停请求
+	for _, group := range duplicateGroups {
+		// 收集所有需要暂停的种子ID
 		var torrentIDs []int64
-		for _, torrent := range group {
-			if torrent.ID != nil {
-				torrentIDs = append(torrentIDs, *torrent.ID)
+
+		// 添加合集ID
+		if group.Collection != nil && group.Collection.ID != nil {
+			torrentIDs = append(torrentIDs, *group.Collection.ID)
+		}
+
+		// 添加所有分集ID
+		for _, episode := range group.Episodes {
+			if episode != nil && episode.ID != nil {
+				torrentIDs = append(torrentIDs, *episode.ID)
 			}
 		}
 
