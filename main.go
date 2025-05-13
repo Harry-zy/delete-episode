@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -28,6 +29,9 @@ type DuplicateGroup struct {
 	Episodes        []*transmissionrpc.Torrent // 分集种子（较小的文件）
 	HasFileOverlaps bool                       // 是否文件列表有重叠
 }
+
+// 用于识别剧集号的正则表达式
+var episodeRegex = regexp.MustCompile(`[Ss](\d+)[Ee](\d+)`)
 
 func main() {
 	reader := bufio.NewReader(os.Stdin)
@@ -142,7 +146,7 @@ func main() {
 			// 显示合集信息
 			if group.Collection != nil && group.Collection.ID != nil && group.Collection.SizeWhenDone != nil {
 				collectionSize := (*group.Collection.SizeWhenDone).MB()
-				fmt.Printf("合集: ID: %d, 大小: %.2f MB\n", *group.Collection.ID, collectionSize)
+				fmt.Printf("合集(不会被暂停): ID: %d, 大小: %.2f MB\n", *group.Collection.ID, collectionSize)
 			}
 
 			// 显示大小相同分集信息
@@ -175,6 +179,20 @@ func main() {
 		if group.Collection != nil && group.Collection.ID != nil && group.Collection.SizeWhenDone != nil {
 			collectionSize := (*group.Collection.SizeWhenDone).MB()
 			fmt.Printf("合集(不会被暂停): ID: %d, 大小: %.2f MB\n", *group.Collection.ID, collectionSize)
+
+			// 显示合集的文件列表
+			collectionFiles, err := getTorrentFiles(client, group.Collection.ID)
+			if err == nil && len(collectionFiles) > 0 {
+				fmt.Println("  合集文件列表:")
+				for i, file := range collectionFiles {
+					if i < 5 { // 最多显示5个文件
+						fmt.Printf("    - %s\n", file.Name)
+					} else {
+						fmt.Printf("    - ... 以及 %d 个更多文件\n", len(collectionFiles)-5)
+						break
+					}
+				}
+			}
 		}
 
 		// 显示分集信息
@@ -183,6 +201,20 @@ func main() {
 			if episode != nil && episode.ID != nil && episode.SizeWhenDone != nil {
 				episodeSize := (*episode.SizeWhenDone).MB()
 				fmt.Printf("  %d. ID: %d, 大小: %.2f MB\n", i+1, *episode.ID, episodeSize)
+
+				// 显示分集的文件列表
+				episodeFiles, err := getTorrentFiles(client, episode.ID)
+				if err == nil && len(episodeFiles) > 0 {
+					fmt.Println("    文件列表:")
+					for j, file := range episodeFiles {
+						if j < 3 { // 最多显示3个文件
+							fmt.Printf("      - %s\n", file.Name)
+						} else {
+							fmt.Printf("      - ... 以及 %d 个更多文件\n", len(episodeFiles)-3)
+							break
+						}
+					}
+				}
 			}
 		}
 
@@ -239,7 +271,7 @@ func findCollectionsAndEpisodes(client *transmissionrpc.Client, torrents []trans
 	// 查找合集和分集
 	result := make(map[string]DuplicateGroup)
 	onlySameSizeResult := make(map[string]DuplicateGroup)
-	var processedCount, skippedCount, withoutEpisodesCount, sameSizeCount, onlySameSizeEpisodesCount int
+	var processedCount, skippedCount, withoutEpisodesCount, sameSizeCount, onlySameSizeEpisodesCount, differentEpisodesCount int
 
 	for name, group := range nameGroups {
 		processedCount++
@@ -321,9 +353,10 @@ func findCollectionsAndEpisodes(client *transmissionrpc.Client, torrents []trans
 						episodeSize = (*episode.SizeWhenDone).Byte()
 					}
 
-					// 检查分集文件是否包含在合集中
-					overlap := checkFileOverlap(collectionFiles, episodeFiles)
-					if overlap {
+					// 检查分集文件是否实际上是合集的一部分
+					isActualEpisode, overlappingFiles := checkActualEpisodeOverlap(collectionFiles, episodeFiles)
+
+					if isActualEpisode {
 						hasFileOverlaps = true
 						episodeCopy := episode // 创建副本以避免引用问题
 
@@ -335,6 +368,13 @@ func findCollectionsAndEpisodes(client *transmissionrpc.Client, torrents []trans
 							// 大小不同，是需要处理的分集
 							episodes = append(episodes, &episodeCopy)
 						}
+					} else if overlappingFiles > 0 {
+						// 有重叠但不是真正的分集关系（可能是不同剧集）
+						if collection.Name != nil && episode.Name != nil {
+							fmt.Printf("跳过可能是不同剧集的种子: %s 和 %s (有 %d 个重叠文件)\n",
+								*collection.Name, *episode.Name, overlappingFiles)
+						}
+						differentEpisodesCount++
 					}
 				}
 
@@ -387,11 +427,104 @@ func findCollectionsAndEpisodes(client *transmissionrpc.Client, torrents []trans
 	fmt.Printf("- 处理种子组数量: %d\n", processedCount)
 	fmt.Printf("- 跳过种子组数量: %d\n", skippedCount)
 	fmt.Printf("- 跳过大小相同的种子组数量: %d\n", sameSizeCount)
+	fmt.Printf("- 跳过不同剧集的种子组数量: %d\n", differentEpisodesCount)
 	fmt.Printf("- 没有找到分集的种子组数量: %d\n", withoutEpisodesCount)
 	fmt.Printf("- 只有大小相同分集的种子组数量: %d\n", onlySameSizeEpisodesCount)
 	fmt.Printf("- 符合条件的种子组数量: %d\n", len(result))
 
 	return result, onlySameSizeResult
+}
+
+// 检查是否真正的分集关系并返回重叠文件数量
+func checkActualEpisodeOverlap(collectionFiles, episodeFiles []*transmissionrpc.TorrentFile) (bool, int) {
+	// 如果文件数量不对，可能不是分集与合集的关系
+	// 通常合集应该有更多的文件，或者至少等于分集文件数
+	if len(collectionFiles) < len(episodeFiles) {
+		return false, 0
+	}
+
+	// 检查重叠的文件
+	var matchCount int
+	var hasEpisodeMarker bool
+
+	// 提取所有文件的剧集信息
+	collectionEpisodes := make(map[string]bool)
+	episodeEpisodes := make(map[string]bool)
+
+	// 先检查是否存在剧集标识，如S01E01, S01E02等
+	for _, file := range collectionFiles {
+		epMarker := extractEpisodeMarker(file.Name)
+		if epMarker != "" {
+			collectionEpisodes[epMarker] = true
+		}
+	}
+
+	for _, file := range episodeFiles {
+		epMarker := extractEpisodeMarker(file.Name)
+		if epMarker != "" {
+			episodeEpisodes[epMarker] = true
+			hasEpisodeMarker = true
+		}
+	}
+
+	// 如果发现都有剧集标识，且标识完全不同，则不是合集与分集的关系
+	if hasEpisodeMarker && len(collectionEpisodes) > 0 && len(episodeEpisodes) > 0 {
+		// 检查是否有交集
+		hasIntersection := false
+		for marker := range episodeEpisodes {
+			if collectionEpisodes[marker] {
+				hasIntersection = true
+				break
+			}
+		}
+
+		// 如果没有交集，这些可能是不同的剧集，不是合集与分集的关系
+		if !hasIntersection {
+			// 记录有多少个重叠文件
+			for _, episodeFile := range episodeFiles {
+				for _, collectionFile := range collectionFiles {
+					// 根据文件名（去掉路径和剧集标识）来比较
+					episodeFileName := getFileName(episodeFile.Name)
+					collectionFileName := getFileName(collectionFile.Name)
+
+					if strings.Contains(episodeFileName, collectionFileName) ||
+						strings.Contains(collectionFileName, episodeFileName) {
+						matchCount++
+						break
+					}
+				}
+			}
+			return false, matchCount
+		}
+	}
+
+	// 常规文件对比
+	for _, episodeFile := range episodeFiles {
+		for _, collectionFile := range collectionFiles {
+			// 根据文件名（去掉路径）来比较
+			episodeFileName := getFileName(episodeFile.Name)
+			collectionFileName := getFileName(collectionFile.Name)
+
+			// 检查是否为完全匹配或合集包含分集
+			if episodeFileName == collectionFileName ||
+				strings.Contains(collectionFileName, episodeFileName) {
+				matchCount++
+				break
+			}
+		}
+	}
+
+	// 如果50%以上的分集文件在合集中找到，则认为有重叠
+	return matchCount >= len(episodeFiles)/2, matchCount
+}
+
+// 提取文件名中的剧集标识（如S01E01）
+func extractEpisodeMarker(filename string) string {
+	matches := episodeRegex.FindStringSubmatch(filename)
+	if len(matches) >= 3 {
+		return matches[0] // 返回完整的匹配，如S01E01
+	}
+	return ""
 }
 
 // 计算绝对值
@@ -422,28 +555,6 @@ func getTorrentFiles(client *transmissionrpc.Client, torrentID *int64) ([]*trans
 	}
 
 	return torrent[0].Files, nil
-}
-
-// 检查文件重叠
-func checkFileOverlap(collectionFiles, episodeFiles []*transmissionrpc.TorrentFile) bool {
-	// 如果分集的所有文件都在合集中找到，则认为有重叠
-	var matchCount int
-
-	for _, episodeFile := range episodeFiles {
-		for _, collectionFile := range collectionFiles {
-			// 根据文件名（去掉路径）来比较
-			episodeFileName := getFileName(episodeFile.Name)
-			collectionFileName := getFileName(collectionFile.Name)
-
-			if episodeFileName == collectionFileName {
-				matchCount++
-				break
-			}
-		}
-	}
-
-	// 如果50%以上的分集文件在合集中找到，则认为有重叠
-	return matchCount >= len(episodeFiles)/2
 }
 
 // 从完整路径中获取文件名
